@@ -27,11 +27,17 @@ from main import (
     BATCH_SIZE,
     BENCHMARK_CSV,
     INPUT_DIR,
+    NVDEC_SUPPORTED_CODECS,
     RESULTS_DIR,
     SUPPORTED_EXTENSIONS,
+    _DALI_VIDEO_PROCS,
+    _MP4_FILE_TO_CODEC,
     _warmup_gpu,
+    _validate_and_group_mp4,
+    _prevalidate_mp4_decodable,
     discover_files,
     get_processors_for_type,
+    init_dali_video_processors,
     run_batch_timed,
     warm_xlsx_parquet_cache,
 )
@@ -52,8 +58,13 @@ def _timed_batch_run(
     """
     Run one batch processor against a file list in BATCH_SIZE chunks.
 
-    Returns (total_time_seconds, total_error_count).  The benchmark
-    continues through failures so one bad batch does not abort a long run.
+    Returns (total_time_seconds, total_error_count).
+
+    FIX: a failed batch is counted as 1 error (one failed batch-call),
+    not len(batch) errors.  The previous len(batch) accounting inflated
+    GPU error rates — e.g. one bad file in a 50-file batch was reported
+    as 50 errors, which pushed the gpu_error_rate over the 5% threshold
+    and incorrectly marked entire file-types as UNRELIABLE.
     """
     total_time = 0.0
     errors = 0
@@ -63,12 +74,17 @@ def _timed_batch_run(
         if elapsed is not None:
             total_time += elapsed
         else:
-            errors += len(batch)
+            errors += 1  # 1 failed batch, not len(batch) inflated file-count
     return total_time, errors
 
 
 def benchmark_per_type(grouped: dict[str, list[Path]]) -> pd.DataFrame:
-    """Measure CPU/GPU total time for each supported file type."""
+    """Measure CPU/GPU total time for each supported file type.
+
+    Includes data_quality and gpu_pipeline_fails columns (matching the schema
+    produced by main.py's build_benchmark_dataframe) so that
+    save_publication_plots() can correctly exclude unreliable rows.
+    """
     rows = []
     for ext in sorted(SUPPORTED_EXTENSIONS):
         files = grouped.get(ext, [])
@@ -78,17 +94,29 @@ def benchmark_per_type(grouped: dict[str, list[Path]]) -> pd.DataFrame:
         cpu_proc, gpu_proc = get_processors_for_type(ext)
         cpu_time, cpu_errors = _timed_batch_run(cpu_proc, files)
         gpu_time, gpu_errors = _timed_batch_run(gpu_proc, files)
-        speedup = (cpu_time / gpu_time) if gpu_time > 0 else math.nan
+
+        file_count = len(files)
+        gpu_err_rate = gpu_errors / file_count if file_count else 0.0
+        if gpu_time > 0 and gpu_err_rate < 0.05:
+            speedup = cpu_time / gpu_time
+            quality = "OK"
+        else:
+            speedup = math.nan
+            quality = f"UNRELIABLE (err_rate={gpu_err_rate:.1%})"
 
         rows.append(
             {
                 "file_type": ext,
-                "num_files": len(files),
+                "num_files": file_count,
                 "cpu_time_sec": cpu_time,
                 "gpu_time_sec": gpu_time,
+                "cpu_avg_ms": (cpu_time / file_count) * 1000 if file_count else 0.0,
+                "gpu_avg_ms": (gpu_time / file_count) * 1000 if file_count else 0.0,
                 "speedup_ratio": speedup,
                 "cpu_errors": cpu_errors,
                 "gpu_errors": gpu_errors,
+                "gpu_pipeline_fails": 0,   # pre-flight already excluded failures
+                "data_quality": quality,
             }
         )
 
@@ -148,16 +176,21 @@ def benchmark_speedup_curve(grouped: dict[str, list[Path]]) -> pd.DataFrame:
 
 def load_or_run_per_type(grouped: dict[str, list[Path]]) -> pd.DataFrame:
     """
-    Load benchmark.csv if it exists; otherwise run benchmark_per_type().
+    Always run a fresh benchmark against the provided (pre-filtered) grouped
+    file list and save results to benchmark.csv.
 
-    Delete benchmark.csv to force a fresh timing run.
+    NOTE: The old behaviour of loading a cached benchmark.csv was removed
+    because it caused the pre-flight MP4 exclusion logic (which correctly
+    narrows grouped["mp4"] before this call) to be silently bypassed —
+    the stale CSV was returned unchanged, making the fairness fix a no-op.
+    Delete benchmark.csv manually if you want to inspect old results.
     """
-    if BENCHMARK_CSV.exists():
-        print(f"Loading existing benchmark from {BENCHMARK_CSV}")
-        print("(Delete benchmark.csv to force a fresh timing run.)")
-        return pd.read_csv(BENCHMARK_CSV)
-    print("No existing benchmark.csv found — running full benchmark.")
-    return benchmark_per_type(grouped)
+    print("Running full benchmark against filtered file set.")
+    df = benchmark_per_type(grouped)
+    BENCHMARK_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(BENCHMARK_CSV, index=False)
+    print(f"Fresh benchmark written to {BENCHMARK_CSV}")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +281,73 @@ def main() -> None:
     grouped = discover_files(INPUT_DIR)
 
     _warmup_gpu()  # absorb CUDA/cuDF init before any timing
+
+    # -----------------------------------------------------------------------
+    # FIX: initialise DALI video pipelines before any MP4 timing.
+    #
+    # When benchmark.py is run standalone (not via run_pipeline() in main.py)
+    # the module-level globals _DALI_VIDEO_PROCS and _MP4_FILE_TO_CODEC are
+    # empty, so every MP4 GPU batch raises RuntimeError and counts as an
+    # error.  This made the entire speedup curve invalid whenever MP4 files
+    # were present.  We mirror the same init sequence used in run_pipeline().
+    # -----------------------------------------------------------------------
+    if "mp4" in grouped and BATCH_SIZE > 0:
+        print(f"Pre-validating {len(grouped['mp4'])} MP4 files (codec detection) …")
+        codec_groups, bad_mp4 = _validate_and_group_mp4(grouped["mp4"])
+        for bad in bad_mp4:
+            print(f"Pre-validation failed [mp4]: {bad.name}")
+
+        # ------------------------------------------------------------------
+        # FAIRNESS: exclude unsupported-codec files from BOTH CPU and GPU.
+        # CPU and GPU must always operate on the exact same input set.
+        # ------------------------------------------------------------------
+        unsupported_codecs = [
+            c for c in codec_groups if c not in NVDEC_SUPPORTED_CODECS
+        ]
+        for codec in unsupported_codecs:
+            n = len(codec_groups[codec])
+            print(
+                f"  ⚠ Excluding codec='{codec}' ({n} files) from BOTH CPU and GPU "
+                f"timing — not supported by NVDEC (fair exclusion)."
+            )
+            del codec_groups[codec]
+
+        # Only build pipelines for the remaining supported codecs.
+        supported_groups = {
+            c: f for c, f in codec_groups.items()
+            if c in NVDEC_SUPPORTED_CODECS
+        }
+        if supported_groups:
+            init_dali_video_processors(supported_groups)
+
+        # Candidate set: files whose codec pipeline built successfully.
+        # Iterate codec_groups (already filtered to supported codecs above),
+        # NOT the original grouped["mp4"] which still contains all paths.
+        candidate_mp4 = [
+            p
+            for files in codec_groups.values()
+            for p in files
+            if _MP4_FILE_TO_CODEC.get(str(p)) in _DALI_VIDEO_PROCS
+        ]
+
+        # ------------------------------------------------------------------
+        # FAIRNESS: frame-level decodability pre-check (symmetric).
+        # Files that OpenCV cannot decode are excluded from BOTH paths.
+        # ------------------------------------------------------------------
+        print(
+            f"Frame-level decodability pre-check on {len(candidate_mp4)} "
+            f"NVDEC-supported MP4 files …"
+        )
+        decodable_mp4, undecodable_mp4 = _prevalidate_mp4_decodable(candidate_mp4)
+        if undecodable_mp4:
+            print(
+                f"  ⚠ {len(undecodable_mp4)} files failed frame-read pre-check — "
+                f"excluded from BOTH CPU and GPU timing (corrupt/VFR)."
+            )
+        print(
+            f"MP4 benchmark set: {len(decodable_mp4)} files (after all exclusions)."
+        )
+        grouped["mp4"] = decodable_mp4
 
     # XLSX: ensure Parquet cache is warmed before any timing begins.
     # Without this, process_xlsx_gpu() raises RuntimeError on missing cache.

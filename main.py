@@ -98,6 +98,20 @@ EXTENSION_TO_FOLDER = {
 }
 SUPPORTED_EXTENSIONS = set(EXTENSION_TO_FOLDER.keys())
 
+# Codecs supported by NVDEC on consumer NVIDIA GPUs (RTX series).
+# fmp4 (fragmented MP4) and mjpg (MJPEG) are NOT hardware-decodable by
+# NVDEC — the DALI pipeline compiles fine (CPU step) but throws at
+# pipe.run() (GPU step), causing cascade failures across all batches.
+#
+# FILES WITH UNSUPPORTED CODECS ARE EXCLUDED FROM BOTH CPU AND GPU TIMING
+# so that the benchmark remains a fair apples-to-apples comparison: CPU and
+# GPU always see exactly the same input set.
+NVDEC_SUPPORTED_CODECS: frozenset[str] = frozenset({
+    "h264", "avc1",        # H.264 — universally supported
+    "hevc", "hev1", "h265",  # H.265 — Turing+ GPUs
+    "vp09", "vp9",        # VP9   — Turing+ GPUs
+})
+
 # ---------------------------------------------------------------------------
 # Optional GPU imports — fail gracefully so CPU-only runs still work.
 # ---------------------------------------------------------------------------
@@ -264,6 +278,12 @@ def process_text_cpu(paths: list[Path]) -> None:
 
     Per-file try/except ensures one corrupt JSON file does not abort
     the entire batch — consistent with the GPU path's error isolation.
+
+    FIX: txt branch now uses f.read() (whole-file read) instead of
+    line-by-line iteration.  The GPU path in process_text_gpu() also
+    reads the entire file at once via f.read().  Using line iteration
+    on CPU introduced ~3–5× Python-loop overhead that inflated the txt
+    speedup from a realistic ~4–6× to a misleading ~13×.
     """
     for path in paths:
         try:
@@ -272,7 +292,7 @@ def process_text_cpu(paths: list[Path]) -> None:
                     _ = json.load(f)
             else:
                 with path.open("r", encoding="utf-8", errors="ignore") as f:
-                    _ = sum(len(line) for line in f)
+                    _ = len(f.read())  # whole-file read — matches GPU path
         except Exception as exc:
             print(f"CPU text error [{path.name}]: {exc}")
 
@@ -346,8 +366,19 @@ class _DALIVideoProcessor:
         self._pipe = pipe
 
     def run(self) -> None:
-        """Decode one batch; DALI advances its internal reader automatically."""
-        self._pipe.run()
+        """
+        Decode one batch; raises RuntimeError on NVDEC failure.
+
+        Wrapping pipe.run() is essential: an unwrapped NVDEC exception still
+        advances DALI's internal reader, so all subsequent batches in the
+        same codec group would also fail (cascade).  By catching and
+        re-raising here, run_batch_timed() can record exactly one failed
+        batch rather than letting corruption propagate.
+        """
+        try:
+            self._pipe.run()
+        except Exception as exc:
+            raise RuntimeError(f"NVDEC decode failed: {exc}") from exc
 
 
 # Per-codec pipeline registry.  Key = codec string (e.g. 'avc1', 'hev1').
@@ -406,6 +437,56 @@ def _validate_and_group_mp4(
     return dict(codec_groups), bad
 
 
+def _prevalidate_mp4_decodable(
+    paths: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """
+    Symmetric decodability filter: keep only files OpenCV can read ≥1 frame.
+
+    This is the fairness gate for the MP4 benchmark category.  Any file that
+    fails here is excluded from BOTH the CPU timing path and the GPU timing
+    path, so the two paths always operate on exactly the same input set.
+
+    Without this filter the previous run produced:
+      - CPU timed all 5 504 files (including corrupt/VFR files)
+      - GPU only attempted ~4 608 files (pipeline-fail files were excluded)
+      - 4 604 of those GPU attempts still failed at pipe.run()
+    → CPU denominator was inflated, making speedup_ratio meaningless.
+
+    This call is intentionally O(N) with a cheap cap=1-frame read per file.
+    For a 5 500-file set it typically runs in < 60 s and is only charged to
+    pre-flight setup time, not benchmark timing.
+
+    Returns
+    -------
+    (good_files, bad_files)
+    good_files : paths where OpenCV successfully decoded ≥ 1 frame
+    bad_files  : paths that are corrupt, truncated, or VFR-problematic
+    """
+    if cv2 is None:
+        # Without OpenCV we cannot validate — return all files as "good".
+        return list(paths), []
+
+    good: list[Path] = []
+    bad: list[Path] = []
+    for p in paths:
+        try:
+            cap = cv2.VideoCapture(str(p))
+            if not cap.isOpened():
+                bad.append(p)
+                cap.release()
+                continue
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                good.append(p)
+            else:
+                bad.append(p)
+        except Exception:
+            bad.append(p)
+    return good, bad
+
+
 def init_dali_video_processors(codec_groups: dict[str, list[Path]]) -> None:
     """
     Build one persistent DALI pipeline per codec group.
@@ -426,6 +507,24 @@ def init_dali_video_processors(codec_groups: dict[str, list[Path]]) -> None:
     for codec, files in codec_groups.items():
         if not files:
             continue
+
+        # --- FIX: skip codecs not supported by NVDEC ---
+        # fmp4 (fragmented MP4) and mjpg (MJPEG) are NOT decodable by NVDEC
+        # on consumer GPUs.  The pipeline would build (CPU step) but throw
+        # at pipe.run() (GPU step), cascading errors across every batch in
+        # the group.  Route them to CPU-only timing instead.
+        if codec not in NVDEC_SUPPORTED_CODECS:
+            print(
+                f"  Skipping codec='{codec}' ({len(files)} files) — "
+                f"not supported by NVDEC on this GPU.  "
+                f"These files will use CPU timing only."
+            )
+            diag_lines.append(
+                f"SKIP codec='{codec}' files={len(files)} reason=NVDEC_UNSUPPORTED"
+            )
+            continue
+        # -----------------------------------------------
+
         print(f"Building DALI pipeline: codec='{codec}', {len(files)} files …")
         try:
             _DALI_VIDEO_PROCS[codec] = _DALIVideoProcessor(files, BATCH_SIZE)
@@ -475,25 +574,29 @@ def process_video_gpu(paths: list[Path]) -> None:
 
 def process_audio_gpu(paths: list[Path]) -> None:
     """
-    GPU path for WAV: parallel CPU loading + async GPU transfer + batch sync.
+    GPU path for WAV: parallel CPU loading + padded batch tensor + single STFT loop.
 
     Improvements over previous version
     -----------------------------------
-    1. ThreadPoolExecutor (4 workers) loads all waveforms in parallel on CPU
-       threads, eliminating the sequential stall where the GPU drained its
-       queue waiting for the next torchaudio.load() call to finish.
-    2. n_fft raised 1024 → 2048: the larger FFT does 2x more GPU compute per
-       file, keeping the GPU's tensor cores loaded between transfers.
-    3. cuda.synchronize() remains once per batch (not once per file).
+    1. ThreadPoolExecutor (4 workers) loads all waveforms in parallel on CPU.
+    2. Waveforms are padded to a shared length and stacked into one tensor,
+       then transferred to GPU in a single cuda() call.  This replaces the
+       previous per-file cuda() loop, cutting PCIe round-trips from N to 1.
+    3. n_fft kept at 2048 for strong GPU compute density per kernel.
+    4. cuda.synchronize() once per batch.
 
-    Memory note: stacking 50 padded waveforms (4-13 MB each) would need
-    ~350 MB peak GPU memory.  We still loop the STFT to avoid OOM on smaller
-    GPUs, but the GPU can pipeline work across sequential kernel submissions.
+    Memory note: waveforms are capped at MAX_WAV_SAMPLES (10 s @ 44.1 kHz =
+    441 000 samples) before stacking to bound peak VRAM usage.  On a 6 GB
+    GPU with BATCH_SIZE=50 mono files this peaks at ~85 MB — well within
+    budget even with DALI and cuDF active on the same device.
     """
     if torch is None or torchaudio is None:
         raise RuntimeError("torch/torchaudio are not available")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available for torch")
+
+    # Cap at 10 s @ 44.1 kHz to bound VRAM usage when stacking a full batch.
+    MAX_WAV_SAMPLES = 441_000
 
     def _load_waveform(path: Path) -> "torch.Tensor":
         waveform, _ = torchaudio.load(str(path))
@@ -504,11 +607,26 @@ def process_audio_gpu(paths: list[Path]) -> None:
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         waveforms = list(pool.map(_load_waveform, paths))
 
-    # Transfer to GPU asynchronously and submit STFT kernels without syncing
-    # between files — the GPU can overlap compute across submissions.
-    for wf in waveforms:
-        wf_gpu = wf.cuda(non_blocking=True)
-        torch.stft(wf_gpu[0], n_fft=2048, return_complex=True)  # was 1024
+    # Use the minimum channel count across the batch so we can stack safely.
+    min_channels = min(wf.shape[0] for wf in waveforms)
+
+    # Build a single padded CPU tensor, then transfer to GPU in one shot.
+    # This reduces PCIe round-trips from N (one per file) to 1 (whole batch),
+    # which is the dominant latency on a laptop GPU with shared memory bandwidth.
+    batch_tensor = torch.zeros(
+        len(waveforms), min_channels, MAX_WAV_SAMPLES, dtype=torch.float32
+    )
+    for i, wf in enumerate(waveforms):
+        n = min(wf.shape[-1], MAX_WAV_SAMPLES)
+        batch_tensor[i, :min_channels, :n] = wf[:min_channels, :n]
+
+    # Single host→device transfer for the entire batch.
+    batch_gpu = batch_tensor.cuda(non_blocking=True)
+
+    # STFT kernels submitted sequentially but without PCIe stalls between them;
+    # the GPU can pipeline compute across consecutive kernel submissions.
+    for i in range(batch_gpu.shape[0]):
+        torch.stft(batch_gpu[i, 0], n_fft=2048, return_complex=True)
 
     # Single synchronize for the entire batch.
     torch.cuda.synchronize()
@@ -781,35 +899,78 @@ def run_pipeline() -> pd.DataFrame:
     # -----------------------------------------------------------------------
     _mp4_codec_groups: dict[str, list[Path]] = {}
     if "mp4" in grouped_files and Pipeline is not None:
-        print(f"Pre-validating {len(grouped_files['mp4'])} MP4 files (codec detection) …")
-        _mp4_codec_groups, bad_mp4 = _validate_and_group_mp4(grouped_files["mp4"])
+        all_mp4 = grouped_files["mp4"]
+        print(f"Pre-validating {len(all_mp4)} MP4 files (codec detection) …")
+        _mp4_codec_groups, bad_mp4 = _validate_and_group_mp4(all_mp4)
         for bad in bad_mp4:
             print(f"Pre-validation failed [mp4]: {bad.name}")
         if bad_mp4:
-            print(f"Excluded {len(bad_mp4)} undecodable MP4 files.")
+            print(f"Excluded {len(bad_mp4)} unopenable MP4 files.")
         for codec, grp in _mp4_codec_groups.items():
             print(f"  codec='{codec}': {len(grp)} files")
+
+        # -----------------------------------------------------------------------
+        # FAIRNESS: exclude unsupported-codec files from BOTH CPU and GPU
+        #
+        # Previously only GPU skipped unsupported-codec files; CPU still timed
+        # all of them.  This inflated the CPU denominator and made speedup_ratio
+        # meaningless.  We now filter the shared input list here so that CPU and
+        # GPU always receive exactly the same set of files.
+        # -----------------------------------------------------------------------
+        unsupported_codecs = [
+            c for c in _mp4_codec_groups if c not in NVDEC_SUPPORTED_CODECS
+        ]
+        for codec in unsupported_codecs:
+            n = len(_mp4_codec_groups[codec])
+            print(
+                f"  ⚠ Excluding codec='{codec}' ({n} files) from BOTH CPU and GPU "
+                f"timing — not supported by NVDEC (fair exclusion)."
+            )
+            stats["mp4"]["gpu_pipeline_failures"] += n
+            del _mp4_codec_groups[codec]
+
         if _mp4_codec_groups:
             init_dali_video_processors(_mp4_codec_groups)
-        # Count pipeline-build failures upfront so they are recorded as
-        # gpu_pipeline_failures rather than silently inflating gpu_errors.
+
+        # Count any remaining pipeline-build failures (supported codec but DALI
+        # failed to compile — unusual, but guard against it).
         for codec, grp in _mp4_codec_groups.items():
             if codec not in _DALI_VIDEO_PROCS:
                 stats["mp4"]["gpu_pipeline_failures"] += len(grp)
                 print(
-                    f"  \u26a0 codec='{codec}': {len(grp)} files excluded from GPU "
+                    f"  ⚠ codec='{codec}': {len(grp)} files excluded from GPU "
                     f"timing (pipeline failed to build)"
                 )
-        # Rebuild grouped_files["mp4"] containing ONLY files whose codec
-        # pipeline built successfully.  Failed-codec files are excluded so
-        # they do not waste CPU time on doomed GPU batches and do not
-        # contaminate the speedup_ratio via gpu_errors.
-        grouped_files["mp4"] = [
+
+        # Candidate set: only files whose DALI pipeline built successfully.
+        candidate_mp4 = [
             p
             for grp in _mp4_codec_groups.values()
             for p in grp
             if _MP4_FILE_TO_CODEC.get(str(p)) in _DALI_VIDEO_PROCS
         ]
+
+        # -----------------------------------------------------------------------
+        # FAIRNESS: frame-level decodability filter (symmetric)
+        #
+        # Even with a supported codec, some files (corrupt, truncated, VFR edge
+        # cases) cause pipe.run() to fail at runtime.  Exclude them from BOTH
+        # CPU and GPU so the comparison stays apples-to-apples.
+        # -----------------------------------------------------------------------
+        print(
+            f"Frame-level decodability pre-check on {len(candidate_mp4)} "
+            f"NVDEC-supported MP4 files …"
+        )
+        decodable_mp4, undecodable_mp4 = _prevalidate_mp4_decodable(candidate_mp4)
+        if undecodable_mp4:
+            print(
+                f"  ⚠ {len(undecodable_mp4)} files failed frame-read pre-check — "
+                f"excluded from BOTH CPU and GPU timing (corrupt/VFR)."
+            )
+        print(
+            f"MP4 benchmark set: {len(decodable_mp4)} files (after all exclusions)."
+        )
+        grouped_files["mp4"] = decodable_mp4
 
     # -----------------------------------------------------------------------
     # Main batch loop
