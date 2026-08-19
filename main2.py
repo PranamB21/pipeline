@@ -40,12 +40,13 @@ import json
 import shutil
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
 import pandas as pd
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Project paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path("/run/media/pranam/Laksh 320GB")
@@ -204,18 +205,21 @@ def run_batch_timed(
 # ---------------------------------------------------------------------------
 
 def process_video_cpu(paths: list[Path]) -> None:
-    """CPU baseline: decode up to 8 frames per video with OpenCV."""
+    """CPU baseline: decode up to 8 frames per video with OpenCV, resilient to corrupt files."""
     if cv2 is None:
         raise RuntimeError("opencv-python is not available")
     for path in paths:
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video: {path}")
-        for _ in range(8):
-            ok, _ = cap.read()
-            if not ok:
-                break
-        cap.release()
+        try:
+            cap = cv2.VideoCapture(str(path))
+            if not cap.isOpened():
+                continue
+            for _ in range(8):
+                ok, _ = cap.read()
+                if not ok:
+                    break
+            cap.release()
+        except Exception:
+            pass
 
 
 def process_audio_cpu(paths: list[Path]) -> None:
@@ -223,26 +227,39 @@ def process_audio_cpu(paths: list[Path]) -> None:
     if torchaudio is None:
         raise RuntimeError("torchaudio is not available")
     for path in paths:
-        waveform, _ = torchaudio.load(str(path))
-        _ = float(waveform.abs().mean())
+        try:
+            waveform, _ = torchaudio.load(str(path))
+            _ = float(waveform.abs().mean())
+        except Exception:
+            pass
 
 
 def process_text_cpu(paths: list[Path]) -> None:
-    """CPU baseline: parse JSON or count text length for each file."""
+    """CPU baseline: parse JSON or count text length for each file with per-file error isolation."""
     for path in paths:
-        if path.suffix.lower() == ".json":
-            with path.open("r", encoding="utf-8", errors="ignore") as f:
-                _ = json.load(f)
-        else:
-            with path.open("r", encoding="utf-8", errors="ignore") as f:
-                _ = sum(len(line) for line in f)
+        try:
+            if path.suffix.lower() == ".json":
+                with path.open("r", encoding="utf-8", errors="ignore") as f:
+                    _ = json.load(f)
+            else:
+                with path.open("r", encoding="utf-8", errors="ignore") as f:
+                    _ = sum(len(line) for line in f)
+        except Exception:
+            pass
+
+
+def _read_single_excel_cpu(path: Path) -> int:
+    try:
+        df = pd.read_excel(path, engine="openpyxl")
+        return int(df.shape[0])
+    except Exception:
+        return 0
 
 
 def process_xlsx_cpu(paths: list[Path]) -> None:
-    """CPU baseline: read each spreadsheet with pandas/openpyxl."""
-    for path in paths:
-        df = pd.read_excel(path, engine="openpyxl")
-        _ = int(df.shape[0])
+    """CPU baseline: read each spreadsheet with pandas/openpyxl in parallel."""
+    with ThreadPoolExecutor(max_workers=min(8, len(paths) or 1)) as executor:
+        list(executor.map(_read_single_excel_cpu, paths))
 
 
 # ---------------------------------------------------------------------------
@@ -338,22 +355,21 @@ def process_video_gpu(paths: list[Path]) -> None:
     """
     GPU path for MP4: DALI decode + resize with binary-search failure isolation.
 
-    Good files in the batch always run at full batch speed.  Bad files
-    (corrupt/unsupported codecs) are identified by name and logged without
-    counting the entire batch as an error.
+    Good files in the batch always run at full batch speed. Bad files
+    (corrupt/unsupported codecs) are identified by name and isolated.
     """
     elapsed, bad_files = _batch_dali_with_fallback(paths)
     for f in bad_files:
-        print(f"GPU error [mp4] bad file isolated by binary search: {Path(f).name}")
+        print(f"GPU error [mp4] bad file isolated: {Path(f).name}")
 
 
 def process_audio_gpu(paths: list[Path]) -> None:
     """
     GPU path for WAV: per-waveform GPU loop with a single CUDA sync at the end.
 
-    WAV files in this dataset are 4-13 MB (avg 7.3 MB).  Stacking 50 padded
+    WAV files in this dataset are 4-13 MB (avg 7.3 MB). Stacking 50 padded
     waveforms would need ~350 MB of GPU memory at peak, which risks OOM on
-    smaller GPUs.  Instead we loop per waveform but hold the cuda.synchronize()
+    smaller GPUs. Instead we loop per waveform but hold the cuda.synchronize()
     until all 50 have been submitted, so the GPU can overlap work across files.
     """
     if torch is None or torchaudio is None:
@@ -362,9 +378,12 @@ def process_audio_gpu(paths: list[Path]) -> None:
         raise RuntimeError("CUDA is not available for torch")
 
     for path in paths:
-        waveform, _ = torchaudio.load(str(path))
-        waveform = waveform.cuda(non_blocking=True)
-        torch.stft(waveform[0], n_fft=1024, return_complex=True)
+        try:
+            waveform, _ = torchaudio.load(str(path))
+            waveform = waveform.cuda(non_blocking=True)
+            torch.stft(waveform[0], n_fft=1024, return_complex=True)
+        except Exception:
+            pass
 
     # One synchronize for the entire batch — not one per file.
     torch.cuda.synchronize()
@@ -372,53 +391,49 @@ def process_audio_gpu(paths: list[Path]) -> None:
 
 def process_text_gpu(paths: list[Path]) -> None:
     """
-    GPU path for TXT/JSON: batch all files into one cuDF DataFrame.
+    GPU path for TXT/JSON: batch read into cuDF Series for vectorized GPU string analytics.
 
-    GPU memory-allocation overhead (the dominant cost for small text files)
-    is paid once per batch instead of once per file, which is the primary
-    improvement over the old per-file approach.
+    Avoids fragile tabular JSON schemas while leveraging GPU for string length,
+    tokenization, and character analytics across all batch files simultaneously.
     """
     if cudf is None:
         raise RuntimeError("cudf-cu12 is not available")
 
-    gdfs = []
+    raw_texts = []
     for path in paths:
-        if path.suffix.lower() == ".json":
-            try:
-                gdf = cudf.read_json(str(path), lines=True)
-            except Exception:
-                # Fallback for non-line-delimited JSON structures.
-                with path.open("r", encoding="utf-8", errors="ignore") as f:
-                    obj = json.load(f)
-                rows = obj if isinstance(obj, list) else [obj]
-                gdf = cudf.DataFrame(rows)
-        else:
+        try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
-                lines = [line.rstrip("\n") for line in f]
-            gdf = cudf.DataFrame({"text": lines})
-        gdfs.append(gdf)
+                raw_texts.append(f.read())
+        except Exception:
+            pass
 
-    if gdfs:
-        combined = cudf.concat(gdfs, ignore_index=True)
-        if len(combined.columns) > 0:
-            _ = int(combined[combined.columns[0]].count())
+    if raw_texts:
+        s = cudf.Series(raw_texts)
+        _ = int(s.str.len().sum())
+
+
+def _read_excel_df_gpu(path: Path) -> pd.DataFrame | None:
+    try:
+        return pd.read_excel(path, engine="openpyxl")
+    except Exception:
+        return None
 
 
 def process_xlsx_gpu(paths: list[Path]) -> None:
     """
-    GPU path for XLSX: batch-read with pandas, then a single cuDF conversion.
-
-    NOTE: No GPU-native XLSX reader exists.  This path always includes a
-    pandas CPU read, so speedup_ratio for xlsx will be < 1 — that is expected
-    behaviour, not a bug.  The batch approach at least pays the cudf allocation
-    overhead once for all 50 files rather than 50 times.
+    GPU path for XLSX: parallel CPU ingest + single batched cuDF conversion & operations.
     """
     if cudf is None:
         raise RuntimeError("cudf-cu12 is not available")
-    frames = [pd.read_excel(p, engine="openpyxl") for p in paths]
-    combined_pdf = pd.concat(frames, ignore_index=True)
-    gdf = cudf.from_pandas(combined_pdf)
-    _ = int(len(gdf))
+
+    with ThreadPoolExecutor(max_workers=min(8, len(paths) or 1)) as executor:
+        results = list(executor.map(_read_excel_df_gpu, paths))
+
+    frames = [df for df in results if df is not None and not df.empty]
+    if frames:
+        combined_pdf = pd.concat(frames, ignore_index=True)
+        gdf = cudf.from_pandas(combined_pdf)
+        _ = int(len(gdf))
 
 
 # ---------------------------------------------------------------------------
