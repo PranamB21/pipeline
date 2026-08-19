@@ -1,3 +1,0 @@
-OK   codec='h264' files=5504
-OK   codec='fmp4' files=768
-OK   codec='mjpg' files=128

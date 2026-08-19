@@ -921,7 +921,18 @@ def build_benchmark_dataframe(
 
         cpu_avg_ms   = (cpu_total / file_count) * 1000 if file_count else 0.0
         gpu_avg_ms   = (gpu_total / file_count) * 1000 if file_count else 0.0
-        gpu_err_rate = record["gpu_errors"] / file_count if file_count else 0.0
+
+        # FIX: gpu_errors counts FAILED BATCHES, not failed files (that was
+        # the earlier fix - counting len(batch) per failure inflated one bad
+        # file into e.g. 50 "errors"). But dividing that batch-level count
+        # by file_count is a units mismatch: with BATCH_SIZE=100-200 and
+        # thousands of files, even a 100%-failing modality (every batch
+        # errors) produces a rate near 0.5-1%, well under the 5% threshold,
+        # so a fully broken GPU path was silently reported as data_quality
+        # "OK". The rate must be computed at the same granularity as the
+        # count: failed batches / total batches attempted.
+        gpu_batches = int(record.get("gpu_batches", 0))
+        gpu_err_rate = record["gpu_errors"] / gpu_batches if gpu_batches else 0.0
 
         # Mark speedup as NaN when >5% of GPU batches errored — the denominator
         # is too polluted by missing timing data to produce a meaningful ratio.
@@ -973,6 +984,14 @@ def run_pipeline() -> pd.DataFrame:
             "gpu_time": 0.0,
             "cpu_errors": 0,
             "gpu_errors": 0,
+            # Total number of GPU batch calls attempted for this ext, pass
+            # or fail. gpu_errors is a count of FAILED BATCHES (not files),
+            # so the error *rate* must be gpu_errors / gpu_batches, not
+            # gpu_errors / files - dividing by file count silently hides
+            # near-total failure once BATCH_SIZE is more than a few files
+            # (e.g. 32 failed batches / 6400 files = 0.5%, even though
+            # every single file failed).
+            "gpu_batches": 0,
             # Files skipped because their DALI pipeline failed to build.
             # Tracked separately so they don't inflate gpu_errors in the loop.
             "gpu_pipeline_failures": 0,
@@ -1103,6 +1122,8 @@ def run_pipeline() -> pd.DataFrame:
                     f"CPU error [{ext}] batch starting at index "
                     f"{batch_start}: {cpu_err}"
                 )
+
+            stats[ext]["gpu_batches"] += 1  # count every attempted batch, pass or fail
 
             gpu_elapsed, gpu_err = run_batch_timed(gpu_processor, batch)
             if gpu_elapsed is not None:

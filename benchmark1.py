@@ -56,11 +56,16 @@ def _timed_batch_run(
     processor,
     files: list[Path],
     ext: str = "",
-) -> tuple[float, int]:
+) -> tuple[float, int, int]:
     """
     Run one batch processor against a file list in BATCH_SIZE chunks.
 
-    Returns (total_time_seconds, total_error_count).
+    Returns (total_time_seconds, total_error_count, total_batches).
+    total_batches is required alongside total_error_count so callers can
+    compute a batch-level error RATE (errors / batches). Dividing
+    errors (a batch-level count) by file_count instead is a units
+    mismatch that hides near-total failure at large BATCH_SIZE - see
+    benchmark_per_type() below.
 
     FIX: a failed batch is counted as 1 error (one failed batch-call),
     not len(batch) errors.  The previous len(batch) accounting inflated
@@ -74,8 +79,10 @@ def _timed_batch_run(
     """
     total_time = 0.0
     errors = 0
+    batches = 0
     for batch_start in range(0, len(files), BATCH_SIZE):
         batch = files[batch_start : batch_start + BATCH_SIZE]
+        batches += 1
         elapsed, err = run_batch_timed(processor, batch)
         if elapsed is not None:
             total_time += elapsed
@@ -86,7 +93,7 @@ def _timed_batch_run(
                 with MP4_GPU_ERROR_LOG.open("a") as _log:
                     for _p in batch:
                         _log.write(f"{_p}\n")
-    return total_time, errors
+    return total_time, errors, batches
 
 
 def benchmark_per_type(grouped: dict[str, list[Path]]) -> pd.DataFrame:
@@ -103,11 +110,16 @@ def benchmark_per_type(grouped: dict[str, list[Path]]) -> pd.DataFrame:
             continue
 
         cpu_proc, gpu_proc = get_processors_for_type(ext)
-        cpu_time, cpu_errors = _timed_batch_run(cpu_proc, files)
-        gpu_time, gpu_errors = _timed_batch_run(gpu_proc, files, ext=ext)
+        cpu_time, cpu_errors, _cpu_batches = _timed_batch_run(cpu_proc, files)
+        gpu_time, gpu_errors, gpu_batches = _timed_batch_run(gpu_proc, files, ext=ext)
 
         file_count = len(files)
-        gpu_err_rate = gpu_errors / file_count if file_count else 0.0
+        # FIX: rate must match the granularity of the count. gpu_errors is
+        # a count of FAILED BATCHES, so the rate is errors/batches, not
+        # errors/file_count - the old errors/file_count version could
+        # report a 100%-failing GPU path as "OK" once BATCH_SIZE made the
+        # batch count much smaller than the file count.
+        gpu_err_rate = gpu_errors / gpu_batches if gpu_batches else 0.0
         if gpu_time > 0 and gpu_err_rate < 0.05:
             speedup = cpu_time / gpu_time
             quality = "OK"
@@ -163,8 +175,8 @@ def benchmark_speedup_curve(grouped: dict[str, list[Path]]) -> pd.DataFrame:
             if not subset:
                 continue
             cpu_proc, gpu_proc = get_processors_for_type(ext)
-            cpu_t, _ = _timed_batch_run(cpu_proc, subset)
-            gpu_t, _ = _timed_batch_run(gpu_proc, subset)
+            cpu_t, _, _ = _timed_batch_run(cpu_proc, subset)
+            gpu_t, _, _ = _timed_batch_run(gpu_proc, subset)
             cpu_total += cpu_t
             gpu_total += gpu_t
 
